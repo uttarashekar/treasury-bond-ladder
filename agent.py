@@ -1,20 +1,20 @@
 """
 Treasury Bond Ladder Agent
 
-An AI agent built with the Anthropic SDK that helps plan, verify, and execute
-a treasury bond ladder strategy. Uses Claude's tool use API with a dedicated
-system prompt and tool definitions.
+Built with the Anthropic SDK's tool_runner and @beta_tool decorator.
+Instead of hand-rolling tool schemas and the agentic loop, the SDK:
+  - Auto-generates JSON schemas from type hints and docstrings (@beta_tool)
+  - Automatically executes tools and feeds results back to Claude (tool_runner)
+  - Manages conversation history internally
 """
 
 import json
-import os
-from anthropic import Anthropic
+from anthropic import Anthropic, beta_tool
 from planner import generate_investment_plan, verify_math, format_plan_table
 from bonds import (
     get_purchase_details_for_month,
-    get_next_purchase,
+    get_next_purchase as _get_next_purchase,
     get_latest_tbill_rate,
-    URLS,
 )
 
 client = Anthropic()
@@ -52,207 +52,141 @@ When asked about the next purchase:
 - Include the direct URL to BuyDirect on TreasuryDirect.gov.
 """
 
-TOOLS = [
-    {
-        "name": "generate_plan",
-        "description": (
-            "Generate a treasury bond ladder investment plan. Splits a total investment "
-            "into monthly 52-week T-Bill purchases so bonds mature one per month. "
-            "Returns a full plan with purchase dates, maturity dates, amounts, and interest."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "total_investment": {
-                    "type": "number",
-                    "description": "Total amount to invest in dollars. Default: 100000",
-                },
-                "num_batches": {
-                    "type": "integer",
-                    "description": "Number of monthly batches (10-12). Default: 10",
-                },
-                "start_date": {
-                    "type": "string",
-                    "description": "First purchase date in YYYY-MM-DD format. Default: next month's 1st.",
-                },
-                "annual_rate": {
-                    "type": "number",
-                    "description": "Estimated annual T-Bill discount rate as decimal (e.g., 0.045 for 4.5%). Default: 0.045",
-                },
-            },
-            "required": [],
-        },
-    },
-    {
-        "name": "verify_math",
-        "description": (
-            "Independently verify all math in an investment plan using pure arithmetic. "
-            "Checks total face values, discount calculations, interest amounts, and maturity dates. "
-            "Returns a pass/fail report for each check."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "plan": {
-                    "type": "object",
-                    "description": "The investment plan object to verify (as returned by generate_plan).",
-                },
-            },
-            "required": ["plan"],
-        },
-    },
-    {
-        "name": "get_purchase_details",
-        "description": (
-            "Get detailed purchase instructions for a specific month's bond purchase, "
-            "including TreasuryDirect.gov URLs, form fields, and step-by-step instructions."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "month_number": {
-                    "type": "integer",
-                    "description": "The month number (1-based) in the plan to get details for.",
-                },
-                "plan": {
-                    "type": "object",
-                    "description": "The investment plan object.",
-                },
-            },
-            "required": ["month_number", "plan"],
-        },
-    },
-    {
-        "name": "get_next_purchase",
-        "description": (
-            "Determine which bond to purchase this month based on the current date and the plan. "
-            "Returns full purchase instructions with URLs and form details."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "plan": {
-                    "type": "object",
-                    "description": "The investment plan object.",
-                },
-            },
-            "required": ["plan"],
-        },
-    },
-    {
-        "name": "fetch_current_rate",
-        "description": (
-            "Fetch the latest average T-Bill interest rate from the U.S. Treasury Fiscal Data API. "
-            "Returns the rate as a decimal (e.g., 0.045 for 4.5%)."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-        },
-    },
-]
+
+# ── Tools ──
+# Each @beta_tool function becomes a tool that Claude can call.
+# The SDK auto-generates the JSON schema from:
+#   - Function name → tool name
+#   - First docstring line → tool description
+#   - Type hints → parameter types
+#   - Args section in docstring → parameter descriptions
 
 
-def handle_tool_call(tool_name: str, tool_input: dict) -> str:
-    """Execute a tool and return the result as a JSON string."""
-    if tool_name == "generate_plan":
-        plan = generate_investment_plan(**tool_input)
-        table = format_plan_table(plan)
-        return json.dumps({"plan": plan, "formatted_table": table})
+@beta_tool
+def generate_plan(
+    total_investment: float = 100_000.0,
+    num_batches: int = 10,
+    start_date: str = "",
+    annual_rate: float = 0.045,
+) -> str:
+    """Generate a treasury bond ladder investment plan with purchase dates, maturity dates, amounts, and interest.
 
-    elif tool_name == "verify_math":
-        result = verify_math(tool_input["plan"])
-        return json.dumps(result)
+    Args:
+        total_investment: Total amount to invest in dollars. Default 100000.
+        num_batches: Number of monthly batches (10-12). Default 10.
+        start_date: First purchase date in YYYY-MM-DD format. Default next month.
+        annual_rate: Estimated annual T-Bill discount rate as decimal (e.g. 0.045 for 4.5%).
+    """
+    kwargs = {"total_investment": total_investment, "num_batches": num_batches, "annual_rate": annual_rate}
+    if start_date:
+        kwargs["start_date"] = start_date
+    plan = generate_investment_plan(**kwargs)
+    table = format_plan_table(plan)
+    return json.dumps({"plan": plan, "formatted_table": table})
 
-    elif tool_name == "get_purchase_details":
-        month = tool_input["month_number"]
-        plan = tool_input["plan"]
-        purchases = plan["purchases"]
-        if 1 <= month <= len(purchases):
-            details = get_purchase_details_for_month(month, purchases[month - 1])
-            return json.dumps(details)
-        return json.dumps({"error": f"Month {month} is out of range (1-{len(purchases)})"})
 
-    elif tool_name == "get_next_purchase":
-        details = get_next_purchase(tool_input["plan"])
-        if details:
-            return json.dumps(details)
-        return json.dumps({"message": "All planned purchases are complete!"})
+@beta_tool
+def verify_plan_math(plan: dict) -> str:
+    """Independently verify all math in an investment plan — checks face values, discounts, interest, and maturity dates.
 
-    elif tool_name == "fetch_current_rate":
-        rate = get_latest_tbill_rate()
-        if rate is not None:
-            return json.dumps({
-                "current_rate": rate,
-                "formatted": f"{rate * 100:.2f}%",
-                "source": "U.S. Treasury Fiscal Data API",
-            })
+    Args:
+        plan: The investment plan object as returned by generate_plan.
+    """
+    result = verify_math(plan)
+    return json.dumps(result)
+
+
+@beta_tool
+def get_purchase_details(month_number: int, plan: dict) -> str:
+    """Get detailed purchase instructions for a specific month including TreasuryDirect URLs and form fields.
+
+    Args:
+        month_number: The month number (1-based) in the plan to get details for.
+        plan: The investment plan object.
+    """
+    purchases = plan["purchases"]
+    if 1 <= month_number <= len(purchases):
+        details = get_purchase_details_for_month(month_number, purchases[month_number - 1])
+        return json.dumps(details)
+    return json.dumps({"error": f"Month {month_number} is out of range (1-{len(purchases)})"})
+
+
+@beta_tool
+def get_next_purchase(plan: dict) -> str:
+    """Determine which bond to purchase this month based on the current date and the plan.
+
+    Args:
+        plan: The investment plan object.
+    """
+    details = _get_next_purchase(plan)
+    if details:
+        return json.dumps(details)
+    return json.dumps({"message": "All planned purchases are complete!"})
+
+
+@beta_tool
+def fetch_current_rate() -> str:
+    """Fetch the latest average T-Bill interest rate from the U.S. Treasury Fiscal Data API."""
+    rate = get_latest_tbill_rate()
+    if rate is not None:
         return json.dumps({
-            "error": "Could not fetch current rate. Using default 4.50%.",
-            "fallback_rate": 0.045,
+            "current_rate": rate,
+            "formatted": f"{rate * 100:.2f}%",
+            "source": "U.S. Treasury Fiscal Data API",
         })
+    return json.dumps({
+        "error": "Could not fetch current rate. Using default 4.50%.",
+        "fallback_rate": 0.045,
+    })
 
-    return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+# ── All tools in one list ──
+ALL_TOOLS = [generate_plan, verify_plan_math, get_purchase_details, get_next_purchase, fetch_current_rate]
 
 
 def run_agent(user_message: str, conversation_history: list | None = None) -> tuple[str, list]:
     """
-    Run one turn of the agent loop.
+    Run one turn of the agent.
 
-    Args:
-        user_message: The user's input message.
-        conversation_history: Prior messages for multi-turn context.
+    The tool_runner handles the entire loop:
+      1. Sends the message to Claude
+      2. If Claude calls a tool, executes it and feeds the result back
+      3. Repeats until Claude produces a final text response
 
-    Returns:
-        (assistant_text, updated_conversation_history)
+    No manual stop_reason checking, no tool_result plumbing.
     """
     if conversation_history is None:
         conversation_history = []
 
     conversation_history.append({"role": "user", "content": user_message})
 
-    while True:
-        response = client.messages.create(
-            model="claude-sonnet-4-6-20250514",
-            max_tokens=4096,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=conversation_history,
-        )
+    # tool_runner replaces the manual while-loop + tool dispatch.
+    # It automatically calls our @beta_tool functions when Claude requests them.
+    runner = client.beta.messages.tool_runner(
+        model="claude-sonnet-4-6-20250514",
+        max_tokens=4096,
+        system=SYSTEM_PROMPT,
+        tools=ALL_TOOLS,
+        messages=conversation_history,
+    )
 
-        if response.stop_reason == "tool_use":
-            tool_results = []
-            assistant_content = response.content
+    final_message = runner.until_done()
 
-            for block in response.content:
-                if block.type == "tool_use":
-                    result = handle_tool_call(block.name, block.input)
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result,
-                    })
+    # Extract text from the final response
+    assistant_text = ""
+    for block in final_message.content:
+        if hasattr(block, "text"):
+            assistant_text += block.text
 
-            conversation_history.append({"role": "assistant", "content": assistant_content})
-            conversation_history.append({"role": "user", "content": tool_results})
-            continue
-
-        # End turn — extract text response
-        assistant_text = ""
-        for block in response.content:
-            if hasattr(block, "text"):
-                assistant_text += block.text
-
-        conversation_history.append({"role": "assistant", "content": response.content})
-        return assistant_text, conversation_history
+    conversation_history.append({"role": "assistant", "content": final_message.content})
+    return assistant_text, conversation_history
 
 
 def main():
     """Interactive CLI for the Treasury Bond Ladder Agent."""
     print("=" * 60)
     print("  Treasury Bond Ladder Agent")
-    print("  Powered by Claude — Anthropic SDK")
+    print("  Powered by Claude — Anthropic Agent SDK")
     print("=" * 60)
     print()
     print("Ask me to generate a bond ladder plan, verify math,")
